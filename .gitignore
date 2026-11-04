@@ -1,0 +1,17 @@
+bin/
+obj/
+dist/
+data/
+steam-session.json
+References/*.dll
+*.user
+*.suo
+.vs/
+
+.agents/
+workshop-cache/
+.update-*/
+.update-*.zip
+.update-backup-*/
+*.settings.json
+dependencies/
