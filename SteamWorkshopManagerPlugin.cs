@@ -37,7 +37,7 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
 
     public string Id => "SteamWorkshopManager";
     public string Name => "Steam 工坊管理器";
-    public string Version => "1.0.0";
+    public string Version => "1.0.1";
     public string Author => "ADOFAI Mod Community";
     public string Description => "搜索、预览、下载和管理 ADOFAI Steam 工坊谱面，支持订阅同步与在线更新。";
     public IReadOnlyList<string> Dependencies => Array.Empty<string>();
@@ -71,7 +71,7 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
         }
         catch (Exception exception)
         {
-            _authStoreError = exception.GetBaseException().Message;
+            _authStoreError = exception.Message;
         }
 
         SetStatus("请输入 Steam 账号并登录。登录成功后会保存 Steam 会话并立即同步订阅。");
@@ -128,6 +128,10 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
             ManagerWrapped(connection.IsConnected
                 ? $"已登录 Steam · SteamID {connection.SteamId}"
                 : $"Steam 连接已断开 · SteamID {connection.SteamId}");
+            if (!string.IsNullOrWhiteSpace(_authStoreError))
+                ManagerWrapped($"本次登录会话未能安全保存，仅保留在内存：{_authStoreError}");
+            else if (savedLogin != null)
+                ManagerMuted("自动登录会话已使用本设备密钥加密保存。");
             ImGui.BeginDisabled(!connection.IsConnected);
             if (ImGui.Button("立即同步订阅"))
                 StartManualSync();
@@ -138,19 +142,21 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
             return;
         }
 
-        if (savedLogin != null)
+        if (savedLogin != null || _authStore is { HasSavedSession: true } || _authStore != null && !string.IsNullOrWhiteSpace(_authStoreError))
         {
-            ManagerMuted($"已保存 Steam 会话：{savedLogin.AccountName}");
+            if (savedLogin != null) ManagerMuted($"已加密保存 Steam 会话：{savedLogin.AccountName}");
             ImGui.BeginDisabled(loginBusy);
-            if (ImGui.Button("重试自动登录"))
-                BeginConnection(token => SteamKitConnection.LoginWithRefreshTokenAsync(savedLogin, token), automaticLogin: true);
-            ImGui.SameLine();
-            if (ImGui.Button("清除保存的 Steam 会话"))
-                ForgetSavedLogin();
+            if (savedLogin != null)
+            {
+                if (ImGui.Button("重试自动登录"))
+                    BeginConnection(token => SteamKitConnection.LoginWithRefreshTokenAsync(savedLogin, token), automaticLogin: true);
+                ImGui.SameLine();
+            }
+            if (ImGui.Button("清除保存的 Steam 会话")) ForgetSavedLogin();
             ImGui.EndDisabled();
         }
         if (!string.IsNullOrWhiteSpace(_authStoreError))
-            ManagerWrapped($"无法在 Mod 数据目录保存 Steam 会话：{_authStoreError}");
+            ManagerWrapped($"Steam 会话安全存储：{_authStoreError}");
 
         ImGui.BeginDisabled(loginBusy);
         ImGui.InputText("Steam 账号", ref _username, 128);
@@ -408,23 +414,24 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
         }
         catch (Exception exception)
         {
-            _authStoreError = exception.GetBaseException().Message;
+            _authStoreError = exception.Message;
             return _authStoreError;
         }
     }
 
     private void ForgetSavedLogin()
     {
+        lock (_stateLock) _savedLogin = null;
         try
         {
             _authStore?.Clear();
-            lock (_stateLock)
-                _savedLogin = null;
-            SetStatus("已清除保存的 Steam 会话。");
+            _authStoreError = null;
+            SetStatus("已清除保存的 Steam 会话和设备密钥。");
         }
         catch (Exception exception)
         {
-            SetStatus($"清除保存的 Steam 会话失败：{exception.GetBaseException().Message}");
+            _authStoreError = exception.Message;
+            SetStatus($"清除保存的 Steam 会话失败：{exception.Message}");
         }
     }
 
@@ -600,15 +607,16 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
         connection?.Dispose();
         if (clearSavedLogin)
         {
+            lock (_stateLock) _savedLogin = null;
             try
             {
                 _authStore?.Clear();
-                lock (_stateLock)
-                    _savedLogin = null;
+                _authStoreError = null;
             }
             catch (Exception exception)
             {
-                status += $" 清除保存会话失败：{exception.GetBaseException().Message}";
+                _authStoreError = exception.Message;
+                status += $" 清除保存会话失败：{exception.Message}";
             }
         }
         SetStatus(status);
