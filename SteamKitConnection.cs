@@ -12,11 +12,15 @@ internal sealed class SteamKitConnection : IDisposable
     private readonly SteamClient _client = new();
     private readonly CallbackManager _callbacks;
     private readonly CancellationTokenSource _pumpCancellation = new();
+    private readonly CancellationTokenSource _connectionLost = new();
     private readonly List<IDisposable> _subscriptions = [];
     private readonly TaskCompletionSource _connected = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<SteamUser.LoggedOnCallback> _loggedOn = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<SteamDisconnectReason> _disconnected = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _loggedIn;
     private Task? _pumpTask;
     private SteamWorkshopContentClient? _workshopContentClient;
+    private readonly object _contentClientLock = new();
     private bool _disposed;
 
     private SteamKitConnection()
@@ -25,15 +29,28 @@ internal sealed class SteamKitConnection : IDisposable
         _subscriptions.Add(_callbacks.Subscribe<SteamClient.ConnectedCallback>(_ => _connected.TrySetResult()));
         _subscriptions.Add(_callbacks.Subscribe<SteamClient.DisconnectedCallback>(callback =>
         {
-            var reason = callback.UserInitiated ? "Steam 连接已断开。" : "Steam 连接中断。";
+            var reason = callback.UserInitiated ? "Steam 连接已断开。" : "Steam 网络连接中断。";
+            NotifyDisconnected(new SteamDisconnectReason(reason, true));
             _connected.TrySetException(new IOException(reason));
             _loggedOn.TrySetException(new IOException(reason));
         }));
         _subscriptions.Add(_callbacks.Subscribe<SteamUser.LoggedOnCallback>(callback => _loggedOn.TrySetResult(callback)));
+        _subscriptions.Add(_callbacks.Subscribe<SteamUser.LoggedOffCallback>(callback =>
+            NotifyDisconnected(new SteamDisconnectReason($"Steam 登录已断开（{callback.Result}）。",
+                SteamLogonRejectedException.IsTemporary(callback.Result)))));
     }
 
     public ulong SteamId { get; private set; }
-    public bool IsConnected => !_disposed && _client.IsConnected;
+    public bool IsConnected => !_disposed && Volatile.Read(ref _loggedIn) != 0 && _client.IsConnected
+        && !_disconnected.Task.IsCompleted;
+    public Task<SteamDisconnectReason> Disconnected => _disconnected.Task;
+
+    private void NotifyDisconnected(SteamDisconnectReason reason)
+    {
+        Volatile.Write(ref _loggedIn, 0);
+        _disconnected.TrySetResult(reason);
+        try { _connectionLost.Cancel(); } catch (ObjectDisposedException) { }
+    }
     public SteamSavedLogin SavedLogin { get; private set; } = new(string.Empty, 0, string.Empty, null);
 
     public static async Task<SteamKitConnection> LoginAsync(
@@ -44,9 +61,11 @@ internal sealed class SteamKitConnection : IDisposable
         CancellationToken cancellationToken)
     {
         var connection = new SteamKitConnection();
+        using var connectionCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, connection._connectionLost.Token);
+        var token = connectionCancellation.Token;
         try
         {
-            await connection.ConnectAsync(cancellationToken).ConfigureAwait(false);
+            await connection.ConnectAsync(token).ConfigureAwait(false);
 
             var authSession = await connection._client.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
             {
@@ -56,9 +75,9 @@ internal sealed class SteamKitConnection : IDisposable
                 IsPersistentSession = true,
                 GuardData = guardData,
                 Authenticator = authenticator,
-            }).ConfigureAwait(false);
+            }).WaitAsync(TimeSpan.FromSeconds(45), token).ConfigureAwait(false);
 
-            var authResult = await authSession.PollingWaitForResultAsync(cancellationToken).ConfigureAwait(false);
+            var authResult = await authSession.PollingWaitForResultAsync(token).WaitAsync(token).ConfigureAwait(false);
             connection.SteamId = authSession.SteamID.ConvertToUInt64();
             connection.SavedLogin = new SteamSavedLogin(
                 authResult.AccountName,
@@ -69,9 +88,15 @@ internal sealed class SteamKitConnection : IDisposable
             if (string.IsNullOrWhiteSpace(authResult.RefreshToken))
                 throw new InvalidOperationException("Steam 未返回可持久登录的 refresh token。");
 
-            await connection.LogOnAsync(authResult.AccountName, authResult.RefreshToken, shouldRememberPassword: true, cancellationToken).ConfigureAwait(false);
+            await connection.LogOnAsync(authResult.AccountName, authResult.RefreshToken, shouldRememberPassword: true, token).ConfigureAwait(false);
 
             return connection;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && connection.Disconnected.IsCompleted)
+        {
+            var reason = await connection.Disconnected.ConfigureAwait(false);
+            connection.Dispose();
+            throw new SteamSessionDisconnectedException(reason);
         }
         catch
         {
@@ -85,14 +110,22 @@ internal sealed class SteamKitConnection : IDisposable
         CancellationToken cancellationToken)
     {
         var connection = new SteamKitConnection();
+        using var connectionCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, connection._connectionLost.Token);
+        var token = connectionCancellation.Token;
         try
         {
-            await connection.ConnectAsync(cancellationToken).ConfigureAwait(false);
+            await connection.ConnectAsync(token).ConfigureAwait(false);
 
             connection.SteamId = savedLogin.SteamId;
             connection.SavedLogin = savedLogin;
-            await connection.LogOnAsync(savedLogin.AccountName, savedLogin.RefreshToken, shouldRememberPassword: true, cancellationToken).ConfigureAwait(false);
+            await connection.LogOnAsync(savedLogin.AccountName, savedLogin.RefreshToken, shouldRememberPassword: true, token).ConfigureAwait(false);
             return connection;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && connection.Disconnected.IsCompleted)
+        {
+            var reason = await connection.Disconnected.ConfigureAwait(false);
+            connection.Dispose();
+            throw new SteamSessionDisconnectedException(reason);
         }
         catch
         {
@@ -157,16 +190,18 @@ internal sealed class SteamKitConnection : IDisposable
 
     public Task DownloadPublishedFileAsync(
         WorkshopItem item,
-        string destinationDirectory,
+        WorkshopDownloadWorkspace workspace,
         Action<double, string>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, int parallelChunks)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (!IsConnected || SteamId == 0)
-            throw new InvalidOperationException("Steam 尚未登录。");
-
-        _workshopContentClient ??= new SteamWorkshopContentClient(SavedLogin);
-        return _workshopContentClient.DownloadPublishedFileAsync(item, destinationDirectory, progress, cancellationToken);
+        lock (_contentClientLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!IsConnected || SteamId == 0)
+                throw new InvalidOperationException("Steam 尚未登录。");
+            _workshopContentClient ??= new SteamWorkshopContentClient(SavedLogin);
+            return _workshopContentClient.DownloadPublishedFileAsync(item, workspace, progress, cancellationToken, parallelChunks);
+        }
     }
 
     public async Task<WorkshopSearchPage> SearchWorkshopAsync(string query, int page, int pageSize, CancellationToken cancellationToken)
@@ -285,19 +320,24 @@ internal sealed class SteamKitConnection : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
-            return;
-
-        _disposed = true;
+        lock (_contentClientLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            NotifyDisconnected(new SteamDisconnectReason("Steam 连接已释放。", false));
+            _workshopContentClient?.Dispose();
+        }
         _pumpCancellation.Cancel();
-        _workshopContentClient?.Dispose();
         try { _client.Disconnect(); }
         catch { }
 
         foreach (var subscription in _subscriptions)
             subscription.Dispose();
         _subscriptions.Clear();
-        _pumpCancellation.Dispose();
+        if (_pumpTask != null)
+            _ = _pumpTask.ContinueWith(_ => { _pumpCancellation.Dispose(); _connectionLost.Dispose(); }, CancellationToken.None,
+                TaskContinuationOptions.None, TaskScheduler.Default);
+        else { _pumpCancellation.Dispose(); _connectionLost.Dispose(); }
     }
 
     private void PumpCallbacks()
@@ -311,6 +351,7 @@ internal sealed class SteamKitConnection : IDisposable
         {
             _connected.TrySetException(exception);
             _loggedOn.TrySetException(exception);
+            if (!_disposed) NotifyDisconnected(new SteamDisconnectReason("Steam 连接回调已中断。", true));
         }
     }
 
@@ -332,6 +373,28 @@ internal sealed class SteamKitConnection : IDisposable
 
         var loginResult = await _loggedOn.Task.WaitAsync(TimeSpan.FromSeconds(45), cancellationToken).ConfigureAwait(false);
         if (loginResult.Result != EResult.OK)
-            throw new InvalidOperationException($"Steam 登录失败：{loginResult.Result} / {loginResult.ExtendedResult}。");
+            throw new SteamLogonRejectedException(loginResult.Result, loginResult.ExtendedResult);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_disconnected.Task.IsCompleted)
+            throw new SteamSessionDisconnectedException(await _disconnected.Task.ConfigureAwait(false));
+        if (!_client.IsConnected) throw new IOException("Steam 登录完成前连接已中断。");
+        Volatile.Write(ref _loggedIn, 1);
     }
+}
+
+
+internal sealed record SteamDisconnectReason(string Message, bool Retryable);
+
+internal sealed class SteamLogonRejectedException(EResult result, EResult extendedResult)
+    : Exception($"Steam 登录失败：{result} / {extendedResult}。")
+{
+    internal bool Retryable => IsTemporary(result);
+    internal static bool IsTemporary(EResult result) => result is EResult.OK or EResult.Fail or EResult.NoConnection
+        or EResult.Timeout or EResult.Busy or EResult.ServiceUnavailable or EResult.TryAnotherCM
+        or EResult.ConnectFailed or EResult.IOFailure or EResult.RemoteDisconnect or EResult.RateLimitExceeded;
+}
+
+internal sealed class SteamSessionDisconnectedException(SteamDisconnectReason reason) : IOException(reason.Message)
+{
+    internal bool Retryable => reason.Retryable;
 }

@@ -74,6 +74,8 @@ public sealed partial class SteamWorkshopManagerPlugin
 
     private bool DrawManagerHeader(string status, bool connected, bool needsGuard)
     {
+        bool reconnecting;
+        lock (_stateLock) reconnecting = _reconnecting;
         var available = ImGui.GetContentRegionAvail().X;
         var buttonWidth = Math.Min(Math.Max(96, ImGui.CalcTextSize("关闭").X
             + ImGui.GetStyle().FramePadding.X * 2), Math.Max(1, available * .4f));
@@ -85,7 +87,7 @@ public sealed partial class SteamWorkshopManagerPlugin
             ImGui.TableSetupColumn("##manager-status", ImGuiTableColumnFlags.WidthStretch);
             ImGui.TableSetupColumn("##manager-close", ImGuiTableColumnFlags.WidthFixed, buttonWidth + rightInset);
             ImGui.TableNextColumn();
-            ManagerMuted($"{(connected ? "Steam 已连接" : "Steam 未登录 · 本地管理可用")} · {Version}");
+            ManagerMuted($"{(connected ? "Steam 已连接" : reconnecting ? "Steam 自动重连中 · 本地管理可用" : "Steam 未登录 · 本地管理可用")} · {Version}");
             ManagerWrapped(status);
             if (needsGuard) ManagerWrapped("需要 Steam Guard 验证，请打开“账号与设置”完成登录。");
             ImGui.TableNextColumn();
@@ -284,6 +286,8 @@ public sealed partial class SteamWorkshopManagerPlugin
     {
         if (_downloads == null) return;
         var tasks = _downloads.GetSnapshots();
+        if (ImGui.CollapsingHeader("并发下载设置")) DrawDownloadConcurrencySettings();
+        ManagerMuted($"同时下载上限 {_downloads.ConcurrentTasks} 个项目");
         if (ManagerSearch("查找下载任务", "##task-query", ref _taskQuery)) _taskPage = 1;
         string[] filters = ["全部", "进行中", "失败", "已结束"];
         ManagerSectionTitle("显示状态");
@@ -291,11 +295,14 @@ public sealed partial class SteamWorkshopManagerPlugin
         if (ImGui.Combo("##task-filter", ref _taskFilter, filters, filters.Length)) _taskPage = 1;
         ManagerToolbar(new ManagerAction(_downloads.IsPaused ? "继续队列" : "暂停后续任务", () => _downloads.SetPaused(!_downloads.IsPaused)),
             new ManagerAction("取消全部未完成任务", _downloads.CancelAll), new ManagerAction("清除已结束记录", _downloads.ClearFinished));
-        ManagerMuted($"等待 {tasks.Count(task => task.State == DownloadState.Queued)} · 下载中 {tasks.Count(task => task.State == DownloadState.Running)} · 失败 {tasks.Count(task => task.State == DownloadState.Failed)}");
+        ManagerMuted($"等待 {tasks.Count(task => task.State == DownloadState.Queued)} · 下载中 {tasks.Count(task => task.State == DownloadState.Running)} · 待恢复 {tasks.Count(task => task.State == DownloadState.Interrupted)} · 失败 {tasks.Count(task => task.State == DownloadState.Failed)}");
         if (_downloads.IsPaused) ManagerWrapped("队列已暂停，当前任务继续完成。点击继续队列恢复等待任务。");
+        if (tasks.Any(task => task.State == DownloadState.Interrupted))
+            ManagerWrapped("未完成任务已保存，登录原 Steam 账号后会校验并继续；订阅任务还会核对当前订阅列表。");
+        if (!string.IsNullOrWhiteSpace(_downloads.PersistenceError)) ManagerWrapped(_downloads.PersistenceError);
         var filtered = tasks.Where(task => ManagerPaging.Matches(_taskQuery, task.Title, task.PublishedFileId, task.Message)
             && (_taskFilter switch { 1 => !task.IsTerminal, 2 => task.State == DownloadState.Failed, 3 => task.IsTerminal, _ => true }))
-            .OrderBy(task => task.State == DownloadState.Running ? 0 : task.State == DownloadState.Queued ? 1 : 2)
+            .OrderBy(task => task.State == DownloadState.Running ? 0 : task.State == DownloadState.Queued ? 1 : task.State == DownloadState.Interrupted ? 2 : 3)
             .ThenBy(task => task.IsTerminal ? -task.Id : task.Id).ToArray();
         DrawPager("download-pages", ref _taskPage, filtered.Length);
         ImGui.BeginChild("##download-tasks-page", ManagerListSize(ImGui.GetFrameHeightWithSpacing() * 2), ImGuiChildFlags.Borders | ImGuiChildFlags.AlwaysUseWindowPadding);
@@ -306,9 +313,11 @@ public sealed partial class SteamWorkshopManagerPlugin
             ManagerWrapped($"{task.Title} · {task.StatusText}");
             ManagerMuted($"ID {task.PublishedFileId} · {(task.KeepWithoutSubscription ? "主动下载" : "订阅同步")}");
             if (task.State == DownloadState.Running) ImGui.ProgressBar((float)task.Progress, new Vector2(-1, 0), $"{task.Progress:P0}");
+            else if (task.State is DownloadState.Interrupted or DownloadState.Queued && task.Progress > 0)
+                ImGui.ProgressBar((float)task.Progress, new Vector2(-1, 0), $"上次进度 {task.Progress:P0}，恢复时重新校验");
             ManagerWrapped(task.Message);
-            if (!task.IsTerminal) ManagerToolbar(new ManagerAction("取消任务", () => _downloads.Cancel(task.Id)));
-            if (task.State is DownloadState.Failed or DownloadState.Canceled)
+            if (!task.IsTerminal || task.State == DownloadState.Failed) ManagerToolbar(new ManagerAction("取消任务", () => _downloads.Cancel(task.Id)));
+            if (task.State is DownloadState.Failed or DownloadState.Canceled or DownloadState.Interrupted)
                 ManagerToolbar(new ManagerAction("重试下载", () => EnqueueDownload(task.PublishedFileId, task.KeepWithoutSubscription)));
             ImGui.Separator();
             ImGui.PopID();

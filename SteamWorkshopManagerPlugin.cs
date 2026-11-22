@@ -20,7 +20,6 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
     private SteamAuthStore? _authStore;
     private SteamSavedLogin? _savedLogin;
     private string? _authStoreError;
-    private Task? _autoSyncTask;
     private GitHubUpdateService? _updateService;
     private PluginSettings _settings = new();
     private List<WorkshopItem> _subscriptions = [];
@@ -37,7 +36,7 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
 
     public string Id => "SteamWorkshopManager";
     public string Name => "Steam 工坊管理器";
-    public string Version => "1.0.1";
+    public string Version => "1.2.4";
     public string Author => "ADOFAI Mod Community";
     public string Description => "搜索、预览、下载和管理 ADOFAI Steam 工坊谱面，支持订阅同步与在线更新。";
     public IReadOnlyList<string> Dependencies => Array.Empty<string>();
@@ -53,7 +52,7 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
         _settings = LoadSettings();
         _levelsDirectoryEdit = _settings.LevelsDirectory;
         _settings.SelectedPublishedFileIds ??= [];
-        _downloads = new WorkshopDownloadQueue(ExecuteDownloadAsync);
+        _downloads = new WorkshopDownloadQueue(_pluginDirectory, ExecuteDownloadAsync, _settings.ConcurrentDownloads);
         try
         {
             _authStore = new SteamAuthStore(_pluginDirectory);
@@ -112,6 +111,7 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
         AuthPromptState? authPrompt;
         SteamSavedLogin? savedLogin;
         bool loginBusy;
+        bool reconnecting;
         string status;
         lock (_stateLock)
         {
@@ -119,6 +119,7 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
             authPrompt = _authPrompt;
             savedLogin = _savedLogin;
             loginBusy = _loginBusy;
+            reconnecting = _reconnecting;
             status = _status;
         }
 
@@ -132,6 +133,7 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
                 ManagerWrapped($"本次登录会话未能安全保存，仅保留在内存：{_authStoreError}");
             else if (savedLogin != null)
                 ManagerMuted("自动登录会话已使用本设备密钥加密保存。");
+            ManagerMuted("Steam 意外断线后会自动重连，恢复未完成下载。");
             ImGui.BeginDisabled(!connection.IsConnected);
             if (ImGui.Button("立即同步订阅"))
                 StartManualSync();
@@ -168,8 +170,8 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
         if (loginBusy && authPrompt == null)
         {
             ImGui.SameLine();
-            if (ImGui.Button("取消登录"))
-                CancelSession("已取消 Steam 登录。", clearSavedLogin: false);
+            if (ImGui.Button(reconnecting ? "停止自动重连" : "取消登录"))
+                CancelSession("已停止本次登录和自动重连。", clearSavedLogin: false);
         }
 
         if (authPrompt != null)
@@ -232,9 +234,35 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
             SaveSettings();
         }
 
+        DrawDownloadConcurrencySettings();
         ImGui.InputText("Levels 目录", ref _levelsDirectoryEdit, 512);
         if (ImGui.Button("保存目录设置")) ApplyLevelsDirectory();
         ManagerWrapped("关闭筛选时下载全部订阅；开启后只下载订阅页勾选的项目。每个工坊项目使用 steam_<项目ID> 子目录，项目内谱面和资源保存在一起。");
+    }
+
+    private void DrawDownloadConcurrencySettings()
+    {
+        int concurrentDownloads;
+        int parallelChunks;
+        lock (_stateLock)
+        {
+            concurrentDownloads = _settings.ConcurrentDownloads;
+            parallelChunks = _settings.ParallelChunksPerDownload;
+        }
+        ManagerSectionTitle("下载并发");
+        if (ImGui.SliderInt("同时下载项目数", ref concurrentDownloads, 1, WorkshopDownloadQueue.MaximumConcurrentTasks))
+        {
+            concurrentDownloads = Math.Clamp(concurrentDownloads, 1, WorkshopDownloadQueue.MaximumConcurrentTasks);
+            lock (_stateLock) _settings.ConcurrentDownloads = concurrentDownloads;
+            _downloads?.SetConcurrency(concurrentDownloads);
+            SaveSettings();
+        }
+        if (ImGui.SliderInt("每项目并行分块", ref parallelChunks, 1, ResumableManifestDownload.MaximumParallelChunks))
+        {
+            lock (_stateLock) _settings.ParallelChunksPerDownload = Math.Clamp(parallelChunks, 1, ResumableManifestDownload.MaximumParallelChunks);
+            SaveSettings();
+        }
+        ManagerMuted($"分块设置用于新任务，全部任务合计最多 {ResumableManifestDownload.MaximumGlobalChunks} 个 CDN 分块。降低项目并发会等待当前任务完成。");
     }
 
     private void SetDownloadSelection(string publishedFileId, bool selected)
@@ -277,9 +305,9 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
 
     private async Task DeleteSelectedLevelsAsync(IReadOnlySet<string> folders)
     {
-        if (!await _syncGate.WaitAsync(0).ConfigureAwait(false))
+        if (!await WorkshopDownloadConcurrency.LibraryGate.WaitAsync(0).ConfigureAwait(false))
         {
-            SetStatus("下载或同步正在运行，请暂停后续任务并等当前任务结束后再删除。");
+            SetStatus("本地安装或清理正在进行，请稍后再删除。");
             return;
         }
 
@@ -289,7 +317,11 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
             lock (_stateLock)
                 levelsDirectory = _settings.LevelsDirectory;
 
-            var removed = new WorkshopLevelInstaller(_pluginDirectory, levelsDirectory).RemoveInstalledLevels(folders);
+            var installer = new WorkshopLevelInstaller(_pluginDirectory, levelsDirectory);
+            var ids = installer.GetInstalledLevels().Where(level => folders.Contains(level.Folder))
+                .Select(level => level.PublishedFileId).ToHashSet(StringComparer.Ordinal);
+            _downloads?.CancelProjects(ids);
+            var removed = installer.RemoveInstalledLevels(folders);
             lock (_stateLock)
                 foreach (var level in removed)
                     _selectedDeleteFolders.Remove(level.Folder);
@@ -309,7 +341,7 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
         finally
         {
             RequestLocalLibraryRefresh();
-            _syncGate.Release();
+            WorkshopDownloadConcurrency.LibraryGate.Release();
         }
     }
 
@@ -329,86 +361,19 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
 
         BeginConnection(token =>
         {
-            var authenticator = new SteamGuardPrompt(RequestGuardCodeAsync, SetStatus, token);
+            var authenticator = new SteamGuardPrompt(RequestGuardCodeAsync, status => SetSessionStatus(token, status), token);
             return SteamKitConnection.LoginAsync(username, password, guardData, authenticator, token);
         }, automaticLogin: false);
     }
 
-    private void BeginConnection(Func<CancellationToken, Task<SteamKitConnection>> createConnection, bool automaticLogin)
-    {
-        CancellationTokenSource sessionCancellation;
-        lock (_stateLock)
-        {
-            if (_loginBusy || _connection != null)
-                return;
-            sessionCancellation = CancellationTokenSource.CreateLinkedTokenSource(_unloadCancellation.Token);
-            _sessionCancellation = sessionCancellation;
-            _loginBusy = true;
-            _authPrompt = null;
-            _status = automaticLogin ? "正在使用已保存的 Steam 会话自动登录…" : "正在连接 Steam…";
-        }
-
-        var token = sessionCancellation.Token;
-        _ = Task.Run(async () =>
-        {
-            SteamKitConnection? connection = null;
-            string? persistenceError = null;
-            try
-            {
-                connection = await createConnection(token).ConfigureAwait(false);
-                lock (_stateLock)
-                {
-                    if (_sessionCancellation != sessionCancellation || token.IsCancellationRequested)
-                        throw new OperationCanceledException(token);
-                    persistenceError = PersistSavedLogin(connection.SavedLogin);
-                    _connection = connection;
-                    connection = null;
-                    _status = "Steam 登录成功，正在读取订阅…";
-                }
-
-                lock (_stateLock)
-                    _password = string.Empty;
-                await SynchronizeAsync(token).ConfigureAwait(false);
-                if (persistenceError != null)
-                    SetStatus($"Steam 已登录，但无法保存自动登录会话：{persistenceError}");
-                _autoSyncTask = Task.Run(() => AutoSyncLoopAsync(token), CancellationToken.None);
-            }
-            catch (OperationCanceledException)
-            {
-                SetStatus(automaticLogin ? "已取消 Steam 自动登录。" : "Steam 登录已取消。");
-            }
-            catch (Exception exception)
-            {
-                SetStatus(automaticLogin
-                    ? $"Steam 自动登录失败：{exception.GetBaseException().Message}。可以重新登录或清除保存的会话。"
-                    : $"Steam 登录失败：{exception.GetBaseException().Message}");
-            }
-            finally
-            {
-                connection?.Dispose();
-                lock (_stateLock)
-                {
-                    _loginBusy = false;
-                    _password = string.Empty;
-                    _authPrompt = null;
-                    if (_connection == null && ReferenceEquals(_sessionCancellation, sessionCancellation))
-                    {
-                        _sessionCancellation = null;
-                        sessionCancellation.Dispose();
-                    }
-                }
-            }
-        });
-    }
-
     private string? PersistSavedLogin(SteamSavedLogin savedLogin)
     {
+        _savedLogin = savedLogin; // In-memory reconnect remains available when Keystore persistence fails.
         try
         {
             if (_authStore == null)
-                return _authStoreError ?? "Android 私有存储不可用";
+                return _authStoreError ??= "Android 私有存储不可用";
             _authStore.Save(savedLogin);
-            _savedLogin = savedLogin;
             _authStoreError = null;
             return null;
         }
@@ -420,20 +385,7 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
     }
 
     private void ForgetSavedLogin()
-    {
-        lock (_stateLock) _savedLogin = null;
-        try
-        {
-            _authStore?.Clear();
-            _authStoreError = null;
-            SetStatus("已清除保存的 Steam 会话和设备密钥。");
-        }
-        catch (Exception exception)
-        {
-            _authStoreError = exception.Message;
-            SetStatus($"清除保存的 Steam 会话失败：{exception.Message}");
-        }
-    }
+        => CancelSession("已停止自动登录并清除保存的 Steam 会话。", clearSavedLogin: true);
 
     private async Task<string> RequestGuardCodeAsync(string message, bool previousCodeWasIncorrect, CancellationToken cancellationToken)
     {
@@ -441,6 +393,7 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
         var prompt = new AuthPromptState(message, previousCodeWasIncorrect, completion);
         lock (_stateLock)
         {
+            EnsureSessionToken(cancellationToken);
             _authPrompt = prompt;
             _status = message;
         }
@@ -492,48 +445,67 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
         catch (OperationCanceledException) { }
         catch (Exception exception)
         {
-            SetStatus($"自动同步停止：{exception.GetBaseException().Message}");
+            SetSessionStatus(cancellationToken, $"自动同步停止：{exception.GetBaseException().Message}");
         }
     }
 
-    private async Task SynchronizeAsync(CancellationToken cancellationToken, bool queueDownloads = true)
+    private async Task<bool> SynchronizeAsync(CancellationToken cancellationToken, bool queueDownloads = true, bool waitForGate = false)
     {
         bool entered = false;
+        bool libraryEntered = false;
+        bool receivedSubscriptions = false;
         try
         {
-            entered = queueDownloads && await _syncGate.WaitAsync(0, cancellationToken).ConfigureAwait(false);
-            if (queueDownloads && !entered)
+            if (waitForGate)
             {
-                SetStatus("下载或同步正在运行，可在订阅页刷新列表并手动加入下载。");
-                return;
+                await _syncGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                entered = true;
+            }
+            else entered = await _syncGate.WaitAsync(0, cancellationToken).ConfigureAwait(false);
+            if (!entered)
+            {
+                SetSessionStatus(cancellationToken, "订阅同步正在运行，请稍后刷新。");
+                return false;
             }
 
             SteamKitConnection connection;
             string levelsDirectory;
             lock (_stateLock)
             {
+                EnsureSessionToken(cancellationToken);
                 connection = _connection ?? throw new InvalidOperationException("请先登录 Steam。");
-                levelsDirectory = _settings.LevelsDirectory;
             }
 
-            SetStatus("正在读取 AppID 977950 的完整订阅列表…");
+            SetSessionStatus(cancellationToken, "正在读取 AppID 977950 的完整订阅列表…");
             var subscriptions = await connection.GetSubscribedItemsAsync(cancellationToken).ConfigureAwait(false);
             var subscribedIds = subscriptions.Select(item => item.PublishedFileId).ToHashSet(StringComparer.Ordinal);
+            await WorkshopDownloadConcurrency.LibraryGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            libraryEntered = true;
             bool downloadOnlySelected;
             bool autoDeleteUnsubscribed;
             HashSet<string> selectedDownloadIds;
             lock (_stateLock)
             {
+                EnsureSessionToken(cancellationToken);
+                levelsDirectory = _settings.LevelsDirectory;
                 _subscriptions = subscriptions.ToList();
                 downloadOnlySelected = _settings.DownloadOnlySelected;
                 autoDeleteUnsubscribed = _settings.AutoDeleteUnsubscribed;
                 selectedDownloadIds = _settings.SelectedPublishedFileIds.ToHashSet(StringComparer.Ordinal);
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
+            lock (_stateLock)
+            {
+                EnsureSessionToken(cancellationToken);
+                _downloads?.CancelUnsubscribed(connection, subscribedIds);
+                _downloads?.ResumeForSession(connection, cancellationToken, subscribedIds);
+                receivedSubscriptions = true;
+            }
             if (!queueDownloads)
             {
-                SetStatus($"已读取 {subscriptions.Count} 个订阅项目。");
-                return;
+                SetSessionStatus(cancellationToken, $"已读取 {subscriptions.Count} 个订阅项目。");
+                return true;
             }
 
             var installer = new WorkshopLevelInstaller(_pluginDirectory, levelsDirectory);
@@ -559,72 +531,61 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
                     completed++;
                     continue;
                 }
-                EnqueueDownload(item.PublishedFileId, keepWithoutSubscription: false, item);
-                queued++;
+                if (EnqueueDownload(item.PublishedFileId, keepWithoutSubscription: false, item, expectedSession: cancellationToken)) queued++;
             }
             RequestLocalLibraryRefresh();
-            SetStatus($"订阅已刷新：共 {subscriptions.Count} 项，最新 {completed} 项，跳过 {skipped} 项，加入下载 {queued} 项，清理 {removedItems.Count} 项。");
+            SetSessionStatus(cancellationToken, $"订阅已刷新：共 {subscriptions.Count} 项，最新 {completed} 项，跳过 {skipped} 项，加入下载 {queued} 项，清理 {removedItems.Count} 项。");
 
         }
         catch (OperationCanceledException)
         {
-            SetStatus("同步已取消。");
+            SetSessionStatus(cancellationToken, "同步已取消。");
         }
         catch (Exception exception)
         {
-            SetStatus($"同步失败：{exception.GetBaseException().Message} 未确认完整订阅列表前不会删除本地谱面。");
+            SetSessionStatus(cancellationToken, $"同步失败：{exception.GetBaseException().Message} 未确认完整订阅列表前不会删除本地谱面。");
         }
         finally
         {
-            if (entered)
-                _syncGate.Release();
+            if (libraryEntered) WorkshopDownloadConcurrency.LibraryGate.Release();
+            if (entered) _syncGate.Release();
         }
+        return receivedSubscriptions;
     }
 
     private void CancelSession(string status, bool clearSavedLogin)
     {
-        CancellationTokenSource? cancellation;
-        SteamKitConnection? connection;
+        CancellationTokenSource? loginCancellation;
         lock (_stateLock)
         {
-            cancellation = _sessionCancellation;
+            ++_loginGeneration;
+            loginCancellation = _loginCancellation;
+            _loginCancellation = null;
+            _downloads?.SuspendSession();
             _sessionCancellation = null;
-            connection = _connection;
             _connection = null;
             _authPrompt?.Completion.TrySetCanceled();
             _authPrompt = null;
             _loginBusy = false;
+            _reconnecting = false;
             _password = string.Empty;
             _guardCode = string.Empty;
             _subscriptions.Clear();
+            CancelWorkshopPresentation();
+            CancelWorkshopSearch();
+            if (clearSavedLogin)
+            {
+                _savedLogin = null;
+                try { _authStore?.Clear(); _authStoreError = null; }
+                catch (Exception exception)
+                {
+                    _authStoreError = exception.Message;
+                    status += $" 清除保存会话失败：{exception.Message}";
+                }
+            }
             _status = status;
         }
-        _downloads?.CancelAll();
-        CancelWorkshopPresentation();
-        CancelWorkshopSearch();
-        try { cancellation?.Cancel(); }
-        catch (ObjectDisposedException) { }
-        connection?.Dispose();
-        if (clearSavedLogin)
-        {
-            lock (_stateLock) _savedLogin = null;
-            try
-            {
-                _authStore?.Clear();
-                _authStoreError = null;
-            }
-            catch (Exception exception)
-            {
-                _authStoreError = exception.Message;
-                status += $" 清除保存会话失败：{exception.Message}";
-            }
-        }
-        SetStatus(status);
-        if (cancellation != null)
-        {
-            try { cancellation.Dispose(); }
-            catch (ObjectDisposedException) { }
-        }
+        TryCancel(loginCancellation);
     }
 
     private long AddTask(string publishedFileId, string title, string status, double progress, string message)
@@ -674,6 +635,8 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
                 {
                     if (string.IsNullOrWhiteSpace(settings.LevelsDirectory))
                         settings.LevelsDirectory = WorkshopLevelInstaller.DefaultLevelsDirectory;
+                    settings.ConcurrentDownloads = Math.Clamp(settings.ConcurrentDownloads, 1, WorkshopDownloadQueue.MaximumConcurrentTasks);
+                    settings.ParallelChunksPerDownload = Math.Clamp(settings.ParallelChunksPerDownload, 1, ResumableManifestDownload.MaximumParallelChunks);
                     settings.SelectedPublishedFileIds = (settings.SelectedPublishedFileIds ?? [])
                         .Where(id => ulong.TryParse(id, out _))
                         .Distinct(StringComparer.Ordinal)
@@ -694,6 +657,8 @@ public sealed partial class SteamWorkshopManagerPlugin : IModPlugin, IModSetting
             lock (_stateLock)
                 settings = new PluginSettings
                 {
+                    ConcurrentDownloads = _settings.ConcurrentDownloads,
+                    ParallelChunksPerDownload = _settings.ParallelChunksPerDownload,
                     AutoSync = _settings.AutoSync,
                     DownloadOnlySelected = _settings.DownloadOnlySelected,
                     AutoDeleteUnsubscribed = _settings.AutoDeleteUnsubscribed,

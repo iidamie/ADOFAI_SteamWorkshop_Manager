@@ -49,6 +49,7 @@ internal sealed class WorkshopInstallMarker
     public string PublishedFileId { get; set; } = string.Empty;
     public string Title { get; set; } = string.Empty;
     public int ChartCount { get; set; } = 1;
+    public bool InstallationComplete { get; set; } = true;
     public bool KeepWithoutSubscription { get; set; }
     public long TimeUpdated { get; set; }
     public long FileSize { get; set; }
@@ -58,6 +59,8 @@ internal sealed class WorkshopInstallMarker
 
 internal sealed class PluginSettings
 {
+    public int ConcurrentDownloads { get; set; } = 3;
+    public int ParallelChunksPerDownload { get; set; } = 4;
     public bool AutoSync { get; set; } = true;
     public bool DownloadOnlySelected { get; set; }
     public bool AutoDeleteUnsubscribed { get; set; } = true;

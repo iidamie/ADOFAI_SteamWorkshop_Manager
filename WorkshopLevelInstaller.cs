@@ -32,7 +32,7 @@ internal sealed class WorkshopLevelInstaller
             return false;
 
         var (directory, marker) = markers[0];
-        if (marker.TimeUpdated != item.TimeUpdated
+        if (!marker.InstallationComplete || marker.TimeUpdated != item.TimeUpdated
             || marker.FileSize != item.FileSize
             || marker.ContentHandle != item.ContentHandle)
             return false;
@@ -47,26 +47,29 @@ internal sealed class WorkshopLevelInstaller
 
     public async Task<InstallResult> InstallAsync(
         WorkshopItem item,
-        Func<string, Action<double, string>?, CancellationToken, Task> downloadContent,
+        Func<WorkshopDownloadWorkspace, Action<double, string>?, CancellationToken, Task> downloadContent,
         Action<double, string>? progress,
         CancellationToken cancellationToken,
-        bool keepWithoutSubscription = false)
+        bool keepWithoutSubscription,
+        string accountScope,
+        SemaphoreSlim commitGate,
+        Func<bool> canInstall)
     {
         if (!ulong.TryParse(item.PublishedFileId, out _))
             throw new InvalidDataException("Steam 返回了无效的创意工坊项目 ID。");
         ArgumentNullException.ThrowIfNull(downloadContent);
 
         Directory.CreateDirectory(_scratchDirectory);
-        Directory.CreateDirectory(_levelsDirectory);
 
-        string runDirectory = Path.Combine(_scratchDirectory, Guid.NewGuid().ToString("N"));
+        var workspace = WorkshopDownloadWorkspace.Open(Path.GetDirectoryName(_scratchDirectory)!, accountScope, item);
+        string runDirectory = Path.Combine(_scratchDirectory, "install-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(runDirectory);
-        string contentDirectory = Path.Combine(runDirectory, "content");
+        string contentDirectory = workspace.ContentDirectory;
         string flattenedDirectory = Path.Combine(runDirectory, "flattened");
         try
         {
             Directory.CreateDirectory(contentDirectory);
-            await downloadContent(contentDirectory, progress, cancellationToken).ConfigureAwait(false);
+            await downloadContent(workspace, progress, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             Directory.CreateDirectory(flattenedDirectory);
             progress?.Invoke(0.72d, "正在整理 Steam 工坊文件…");
@@ -77,36 +80,50 @@ internal sealed class WorkshopLevelInstaller
                 .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             if (chartFiles.Length == 0)
+            {
+                workspace.Complete();
                 return new InstallResult(true, "工坊项目中没有 .adofai 谱面文件。", []);
+            }
 
             var projectFiles = Directory.EnumerateFiles(flattenedDirectory, "*", SearchOption.TopDirectoryOnly)
                 .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             cancellationToken.ThrowIfCancellationRequested();
-            var stageDirectory = Path.Combine(runDirectory, "project");
-            Directory.CreateDirectory(stageDirectory);
-            foreach (var projectFile in projectFiles)
-                File.Copy(projectFile, Path.Combine(stageDirectory, Path.GetFileName(projectFile)!), overwrite: false);
-
-            var folderName = ChooseFolderName(item.PublishedFileId);
-            var targetDirectory = Path.Combine(_levelsDirectory, folderName);
-            var stageFiles = Directory.EnumerateFiles(stageDirectory, "*", SearchOption.TopDirectoryOnly).ToArray();
-            var marker = new WorkshopInstallMarker
+            progress?.Invoke(.9d, "文件整理完成，等待提交安装…");
+            await commitGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
             {
-                PublishedFileId = item.PublishedFileId,
-                Title = item.Title,
-                ChartCount = chartFiles.Length,
-                KeepWithoutSubscription = keepWithoutSubscription || FindMarkersForItemWithDirectories(item.PublishedFileId)
-                    .Any(entry => entry.Marker.KeepWithoutSubscription),
-                TimeUpdated = item.TimeUpdated,
-                FileSize = item.FileSize,
-                ContentHandle = item.ContentHandle,
-                Files = stageFiles.Select(path => Path.GetFileName(path)!).OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList(),
-            };
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!canInstall())
+                {
+                    workspace.Complete();
+                    return new InstallResult(true, "项目已取消订阅，不再安装。", []);
+                }
+                Directory.CreateDirectory(_levelsDirectory);
+                var folderName = ChooseFolderName(item.PublishedFileId);
+                var targetDirectory = Path.Combine(_levelsDirectory, folderName);
+                // Flattening has already produced the complete immutable staging set.
+                var stageFiles = projectFiles;
+                var marker = new WorkshopInstallMarker
+                {
+                    PublishedFileId = item.PublishedFileId,
+                    Title = item.Title,
+                    ChartCount = chartFiles.Length,
+                    KeepWithoutSubscription = keepWithoutSubscription || FindMarkersForItemWithDirectories(item.PublishedFileId)
+                        .Any(entry => entry.Marker.KeepWithoutSubscription),
+                    TimeUpdated = item.TimeUpdated,
+                    FileSize = item.FileSize,
+                    ContentHandle = item.ContentHandle,
+                    Files = stageFiles.Select(path => Path.GetFileName(path)!).OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList(),
+                };
 
-            CommitFiles(targetDirectory, item.PublishedFileId, stageFiles, marker);
-            progress?.Invoke(1d, $"已将 {chartFiles.Length} 张谱面及其资源安装到 {folderName}");
-            return new InstallResult(false, $"已将 {chartFiles.Length} 张谱面及其资源安装到同一目录。", [folderName]);
+                cancellationToken.ThrowIfCancellationRequested();
+                CommitFiles(targetDirectory, item.PublishedFileId, stageFiles, marker);
+                workspace.Complete();
+                progress?.Invoke(1d, $"已将 {chartFiles.Length} 张谱面及其资源安装到 {folderName}");
+                return new InstallResult(false, $"已将 {chartFiles.Length} 张谱面及其资源安装到同一目录。", [folderName]);
+            }
+            finally { commitGate.Release(); }
         }
         finally
         {
@@ -388,8 +405,28 @@ internal sealed class WorkshopLevelInstaller
             foreach (var stagedPath in stagedFiles)
             {
                 var name = Path.GetFileName(stagedPath)!;
+                if (!IsSafeDirectFileName(name)) throw new InvalidDataException("工坊项目包含无效文件名。");
+                if (File.Exists(Path.Combine(targetDirectory, name)) && !previousOwned.Contains(name))
+                    throw new IOException($"目标目录中已存在未由本 Mod 管理的文件：{name}");
+            }
+            if (markerWasPresent)
+            {
+                markerBackup = Path.Combine(rollbackDirectory, MarkerFileName);
+                File.Copy(markerPath, markerBackup, overwrite: false);
+            }
+            var provisional = new WorkshopInstallMarker
+            {
+                PublishedFileId = marker.PublishedFileId, Title = marker.Title, ChartCount = marker.ChartCount,
+                TimeUpdated = marker.TimeUpdated, FileSize = marker.FileSize, ContentHandle = marker.ContentHandle,
+                KeepWithoutSubscription = marker.KeepWithoutSubscription, InstallationComplete = false,
+                Files = previousOwned.Union(marker.Files, StringComparer.OrdinalIgnoreCase).ToList(),
+            };
+            WriteMarkerAtomically(targetDirectory, provisional);
+            foreach (var stagedPath in stagedFiles)
+            {
+                var name = Path.GetFileName(stagedPath)!;
                 if (!IsSafeDirectFileName(name))
-            throw new InvalidDataException("工坊项目包含无效文件名。");
+                    throw new InvalidDataException("工坊项目包含无效文件名。");
 
                 var destination = Path.Combine(targetDirectory, name);
                 if (File.Exists(destination) && !previousOwned.Contains(name))
@@ -419,11 +456,6 @@ internal sealed class WorkshopLevelInstaller
                 }
             }
 
-            if (markerWasPresent)
-            {
-                markerBackup = Path.Combine(rollbackDirectory, MarkerFileName);
-                File.Copy(markerPath, markerBackup, overwrite: false);
-            }
             WriteMarkerAtomically(targetDirectory, marker);
         }
         catch

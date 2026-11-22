@@ -18,7 +18,8 @@ public sealed partial class SteamWorkshopManagerPlugin
         if (_downloads != null)
         {
             var tasks = _downloads.GetSnapshots();
-            ManagerMuted($"下载中 {tasks.Count(task => task.State == DownloadState.Running)} · 等待 {tasks.Count(task => task.State == DownloadState.Queued)} · 失败 {tasks.Count(task => task.State == DownloadState.Failed)}");
+            ManagerMuted($"下载中 {tasks.Count(task => task.State == DownloadState.Running)} · 等待 {tasks.Count(task => task.State == DownloadState.Queued)} · 待恢复 {tasks.Count(task => task.State == DownloadState.Interrupted)} · 失败 {tasks.Count(task => task.State == DownloadState.Failed)}");
+            if (!string.IsNullOrWhiteSpace(_downloads.PersistenceError)) ManagerWrapped(_downloads.PersistenceError);
             if (ImGui.Button(_downloads.IsPaused ? "继续下载队列" : "暂停后续下载"))
                 _downloads.SetPaused(!_downloads.IsPaused);
         }
